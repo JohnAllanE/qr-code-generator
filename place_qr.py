@@ -9,7 +9,7 @@ on the command line, e.g.:
 All coordinates are in mm with the origin at the BOTTOM-LEFT of the bed, +x right and
 +y up. The conversion to image pixels (origin top-left, +y down) happens internally.
 The PNG is saved with its DPI embedded so the laser software imports it at true size.
-See PLACEMENT.md for pictures of each anchor and offset.
+Output files go in output/ (OUTPUT_DIR). See README.md for examples and pictures.
 """
 
 import argparse
@@ -81,6 +81,22 @@ def build_matrix(data, error_correction, border):
     return qr.get_matrix()
 
 
+def align(outer_x, outer_y, outer_w, outer_h, w, h, anchor, offset):
+    """
+    Bottom-left corner (y-up) of a w x h rectangle whose `anchor` point lands on the
+    same `anchor` point of the outer rectangle, then shifted by `offset`.
+    """
+    fx, fy = ANCHOR_FRACTIONS[anchor]
+    x = outer_x + fx * (outer_w - w) + offset[0]
+    y = outer_y + fy * (outer_h - h) + offset[1]
+    return x, y
+
+
+def place_part(canvas_w, canvas_h, part_w, part_h, part_anchor, part_offset):
+    """Bottom-left corner of the part on the bed, in bed mm (y-up)."""
+    return align(0, 0, canvas_w, canvas_h, part_w, part_h, part_anchor, part_offset)
+
+
 def place_code(part_x, part_y, part_w, part_h, code_box, anchor, offset):
     """
     Work out where the code goes, in bed mm (y-up).
@@ -94,40 +110,95 @@ def place_code(part_x, part_y, part_w, part_h, code_box, anchor, offset):
     if side <= 0:
         raise ValueError("Code size must be positive (or -1 for as large as possible).")
 
-    fx, fy = ANCHOR_FRACTIONS[anchor]
-    anchor_x = part_x + fx * part_w
-    anchor_y = part_y + fy * part_h
-    x = anchor_x - fx * side + offset[0]
-    y = anchor_y - fy * side + offset[1]
+    x, y = align(part_x, part_y, part_w, part_h, side, side, anchor, offset)
     return x, y, side
 
 
-def draw_qr(draw, matrix, x, y, side, to_px, fill):
+def dark_rects(matrix, x, y, side, shrink_pct=(0.0, 0.0), merge_x=False):
+    """
+    Yield (x0, y0, w, h) in bed mm (y-up, bottom-left corner) for the dark modules of
+    `matrix` placed in the square (x, y, side).
+
+    `shrink_pct` = (x %, y %) shrinks every module about its own centre, separately in
+    each direction, to compensate for the laser burning wider than drawn (dark "bleeding"
+    into the white gaps). Raster lasers mostly bleed along X, their fast travel direction.
+
+    `merge_x` joins each row's run of adjacent dark modules into one rectangle, so the
+    X shrink only applies at the run's two ends, where black meets white.
+    """
+    module = side / len(matrix)
+    inset_x = module * shrink_pct[0] / 200
+    inset_y = module * shrink_pct[1] / 200
+    h = module - 2 * inset_y
+    top = y + side
+    for row, cells in enumerate(matrix):
+        ry = top - (row + 1) * module + inset_y
+        col = 0
+        while col < len(cells):
+            if not cells[col]:
+                col += 1
+                continue
+            start = col
+            col += 1
+            while merge_x and col < len(cells) and cells[col]:
+                col += 1
+            yield x + start * module + inset_x, ry, (col - start) * module - 2 * inset_x, h
+
+
+def draw_qr(draw, matrix, x, y, side, to_px, fill, shrink_pct=(0.0, 0.0), merge_x=False):
     """
     Draw the dark modules of `matrix` into the square (x, y, side) given in bed mm.
 
-    `to_px` maps a bed point (mm, y-up) to image pixels (y-down). Each module edge is
-    rounded on its own so the overall code size stays exact; modules differ by <= 1 px.
+    `to_px` maps a bed point (mm, y-up) to image pixels (y-down). Each edge is rounded
+    on its own so the overall code size stays exact; modules differ by <= 1 px.
     """
-    module = side / len(matrix)
-    top = y + side
-    for row, cells in enumerate(matrix):
-        for col, dark in enumerate(cells):
-            if dark:
-                px0, py0 = to_px(x + col * module, top - row * module)
-                px1, py1 = to_px(x + (col + 1) * module, top - (row + 1) * module)
-                draw.rectangle((round(px0), round(py0), round(px1) - 1, round(py1) - 1), fill=fill)
+    for rx, ry, w, h in dark_rects(matrix, x, y, side, shrink_pct, merge_x):
+        px0, py0 = to_px(rx, ry + h)
+        px1, py1 = to_px(rx + w, ry)
+        draw.rectangle((round(px0), round(py0), round(px1) - 1, round(py1) - 1), fill=fill)
 
 
-def render_canvas(matrix, x, y, side, canvas_w, canvas_h, dpi):
+def render_canvas(matrix, x, y, side, canvas_w, canvas_h, dpi, shrink_pct=(0.0, 0.0), merge_x=False):
     """The laser file: white bed, black modules. Mode "1" keeps a 300 DPI bed small."""
     img = Image.new("1", (round(mm_to_px(canvas_w, dpi)), round(mm_to_px(canvas_h, dpi))), 1)
 
     def to_px(bx, by):
         return mm_to_px(bx, dpi), mm_to_px(canvas_h - by, dpi)
 
-    draw_qr(ImageDraw.Draw(img), matrix, x, y, side, to_px, fill=0)
+    draw_qr(ImageDraw.Draw(img), matrix, x, y, side, to_px, fill=0, shrink_pct=shrink_pct, merge_x=merge_x)
     return img
+
+
+def write_pdf(matrix, x, y, side, canvas_w, canvas_h, path, shrink_pct=(0.0, 0.0), merge_x=False):
+    """
+    The laser file as a vector PDF whose page is exactly the bed size.
+
+    PDF units are points (1/72 in) with the origin at the bottom-left and +y up, the same
+    convention as the bed, so no flip is needed. Each dark module (or row run, with
+    `merge_x`) is its own filled rectangle.
+    """
+    pt = 72 / MM_PER_INCH
+    rects = [f"{rx * pt:.4f} {ry * pt:.4f} {w * pt:.4f} {h * pt:.4f} re"
+             for rx, ry, w, h in dark_rects(matrix, x, y, side, shrink_pct, merge_x)]
+    content = ("0 g\n" + "\n".join(rects) + "\nf\n").encode()
+
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {canvas_w * pt:.4f} {canvas_h * pt:.4f}] "
+        f"/Contents 4 0 R /Resources << >> >>".encode(),
+        b"<< /Length %d >>\nstream\n" % len(content) + content + b"endstream",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for i, obj in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % i + obj + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    out += b"".join(b"%010d 00000 n \n" % o for o in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref)
+    Path(path).write_bytes(out)
 
 
 def _arrow(draw, start, end, color, width=3, head=12):
@@ -190,7 +261,8 @@ def render_preview(matrix, x, y, side, part, anchor, offset, canvas_w, canvas_h,
 
 
 def main():
-    load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
+    project_dir = Path(__file__).resolve().parent
+    load_dotenv(project_dir / ".env", override=True)
     env = os.getenv
 
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -200,37 +272,63 @@ def main():
     parser.add_argument("--dpi", type=int, default=int(env("DPI", 300)))
     parser.add_argument("--part-width", type=float, default=float(env("PART_WIDTH_MM", 200)))
     parser.add_argument("--part-height", type=float, default=float(env("PART_HEIGHT_MM", 120)))
-    parser.add_argument("--part-x", type=float, default=float(env("PART_X_MM", 0)), help="part bottom-left x")
-    parser.add_argument("--part-y", type=float, default=float(env("PART_Y_MM", 0)), help="part bottom-left y")
+    parser.add_argument("--part-anchor", choices=ANCHORS, default=env("PART_ANCHOR", "top-left"),
+                        help="bed corner the part is aligned to")
+    parser.add_argument("--part-offset", default=env("PART_OFFSET_MM", "0,0"), help='"dx,dy" from that corner, up is +')
     parser.add_argument("--code-size", default=env("CODE_SIZE_MM", "-1"), help='"W,H", "S" or -1')
     parser.add_argument("--anchor", choices=ANCHORS, default=env("ANCHOR", "center"))
     parser.add_argument("--offset", default=env("OFFSET_MM", "0,0"), help='"dx,dy", up is +')
     parser.add_argument("--border", type=int, default=int(env("QR_BORDER", 4)), help="quiet zone, modules")
+    parser.add_argument("--bleed-shrink", default=env("BLEED_SHRINK_PERCENT", "0"),
+                        help='"x,y" %% of the module to shrink each dark module by, about its centre; '
+                             'one number = both')
+    parser.add_argument("--merge-x", action=argparse.BooleanOptionalAction,
+                        default=env("MERGE_X_RUNS", "true").strip().lower() in ("1", "true", "yes", "on"),
+                        help="join each row's adjacent dark modules into one rectangle (X shrink at run ends only)")
     parser.add_argument("--ec", choices=ERROR_CORRECTION, default=env("QR_ERROR_CORRECTION", "M"))
+    parser.add_argument("--out-dir", default=env("OUTPUT_DIR", "output"),
+                        help="folder for the files below when given as relative paths")
     parser.add_argument("--out", default=env("OUTPUT_PATH", "laser-qr-code.png"))
+    parser.add_argument("--pdf", default=env("PDF_PATH", "laser-qr-code.pdf"), help="vector PDF; blank = none")
     parser.add_argument("--preview", default=env("PREVIEW_PATH", ""), help="blank = no preview")
     args = parser.parse_args()
 
     if not args.url:
         parser.error("No URL: set TARGET_URL in .env or pass --url")
     try:
+        bleed = parse_pair(args.bleed_shrink, "bleed shrink")
         code_box = parse_code_size(args.code_size)
         offset = parse_offset(args.offset)
+        part_offset = parse_offset(args.part_offset)
     except ValueError as e:
         parser.error(str(e))
+    if not all(0 <= v < 100 for v in bleed):
+        parser.error("--bleed-shrink values must be from 0 up to (not including) 100")
+
+    # Relative output paths go inside the output folder (itself relative to this script).
+    out_dir = project_dir / args.out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    args.out = out_dir / args.out
+    args.pdf = out_dir / args.pdf if args.pdf else None
+    args.preview = out_dir / args.preview if args.preview else None
 
     matrix = build_matrix(args.url, args.ec, args.border)
-    x, y, side = place_code(args.part_x, args.part_y, args.part_width, args.part_height, code_box, args.anchor, offset)
+    part_x, part_y = place_part(args.canvas_width, args.canvas_height, args.part_width, args.part_height,
+                                args.part_anchor, part_offset)
+    if (part_x < 0 or part_y < 0
+            or part_x + args.part_width > args.canvas_width or part_y + args.part_height > args.canvas_height):
+        print("Warning: the part extends past the edge of the bed.")
+    x, y, side = place_code(part_x, part_y, args.part_width, args.part_height, code_box, args.anchor, offset)
 
     if x < 0 or y < 0 or x + side > args.canvas_width or y + side > args.canvas_height:
         raise SystemExit(f"Error: code square ({x:.1f}, {y:.1f}) to ({x + side:.1f}, {y + side:.1f}) mm "
                          f"runs off the {args.canvas_width} x {args.canvas_height} mm canvas.")
     eps = 1e-6
-    if (x < args.part_x - eps or y < args.part_y - eps
-            or x + side > args.part_x + args.part_width + eps or y + side > args.part_y + args.part_height + eps):
+    if (x < part_x - eps or y < part_y - eps
+            or x + side > part_x + args.part_width + eps or y + side > part_y + args.part_height + eps):
         print("Warning: the code (with quiet zone) extends past the edge of the part.")
 
-    img = render_canvas(matrix, x, y, side, args.canvas_width, args.canvas_height, args.dpi)
+    img = render_canvas(matrix, x, y, side, args.canvas_width, args.canvas_height, args.dpi, bleed, args.merge_x)
     img.save(args.out, dpi=(args.dpi, args.dpi))
 
     module_mm = side / len(matrix)
@@ -240,11 +338,26 @@ def main():
     print(f"Code square (incl. quiet zone): bottom-left ({x:.2f}, {y:.2f}) mm, {side:.2f} mm")
     print(f"Dark modules: bottom-left ({x + b:.2f}, {y + b:.2f}) mm, {side - 2 * b:.2f} mm, "
           f"module = {module_mm:.2f} mm ({mm_to_px(module_mm, args.dpi):.1f} px)")
+    if any(bleed):
+        w_mm, h_mm = (module_mm * (1 - v / 100) for v in bleed)
+        if args.merge_x:
+            print(f"Bleed shrink X {bleed[0]:g}%, Y {bleed[1]:g}%, X runs merged: each run of dark modules is "
+                  f"{module_mm - w_mm:.3f} mm narrower than drawn and {h_mm:.3f} mm tall, "
+                  f"gaps {module_mm - h_mm:.3f} mm between rows")
+        else:
+            print(f"Bleed shrink X {bleed[0]:g}%, Y {bleed[1]:g}%: dark modules {w_mm:.3f} wide x {h_mm:.3f} mm tall, "
+                  f"gaps {module_mm - w_mm:.3f} mm between left/right neighbours, "
+                  f"{module_mm - h_mm:.3f} mm between top/bottom")
     if mm_to_px(module_mm, args.dpi) < 3:
         print("Warning: modules are under 3 px; increase --dpi or the code size.")
 
+    if args.pdf:
+        write_pdf(matrix, x, y, side, args.canvas_width, args.canvas_height, args.pdf, bleed, args.merge_x)
+        print(f"Saved {args.pdf}: vector, page {args.canvas_width} x {args.canvas_height} mm "
+              f"(print at Actual size / 100%)")
+
     if args.preview:
-        part = (args.part_x, args.part_y, args.part_width, args.part_height)
+        part = (part_x, part_y, args.part_width, args.part_height)
         preview = render_preview(matrix, x, y, side, part, args.anchor, offset,
                                  args.canvas_width, args.canvas_height, px_per_mm=2)
         preview.save(args.preview)

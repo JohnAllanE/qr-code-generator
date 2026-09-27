@@ -5,3 +5,5 @@ __pycache__/
 .ipynb_checkpoints/
 *.png
 !docs/images/*.png
+*.pdf
+output/
