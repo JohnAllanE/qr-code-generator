@@ -22,6 +22,8 @@ from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
 from qrcode.constants import ERROR_CORRECT_H, ERROR_CORRECT_L, ERROR_CORRECT_M, ERROR_CORRECT_Q
 
+from test_pattern import bleed_test_matrix
+
 MM_PER_INCH = 25.4
 
 ERROR_CORRECTION = {
@@ -45,6 +47,10 @@ ANCHOR_FRACTIONS = {
 
 def mm_to_px(mm, dpi):
     return mm / MM_PER_INCH * dpi
+
+
+def px_to_mm(px, dpi):
+    return px * MM_PER_INCH / dpi
 
 
 def parse_pair(text, name):
@@ -114,21 +120,22 @@ def place_code(part_x, part_y, part_w, part_h, code_box, anchor, offset):
     return x, y, side
 
 
-def dark_rects(matrix, x, y, side, shrink_pct=(0.0, 0.0), merge_x=False):
+def dark_rects(matrix, x, y, side, bleed_mm=(0.0, 0.0), merge_x=False):
     """
     Yield (x0, y0, w, h) in bed mm (y-up, bottom-left corner) for the dark modules of
     `matrix` placed in the square (x, y, side).
 
-    `shrink_pct` = (x %, y %) shrinks every module about its own centre, separately in
-    each direction, to compensate for the laser burning wider than drawn (dark "bleeding"
-    into the white gaps). Raster lasers mostly bleed along X, their fast travel direction.
+    `bleed_mm` = (x, y) moves every edge of every module inwards by that distance,
+    separately in each direction, to compensate for the laser burning wider than drawn
+    (dark "bleeding" into the white gaps). The overburn is a fixed distance set by the
+    laser, not a fraction of the module. Raster lasers mostly bleed along X, their fast
+    travel direction.
 
     `merge_x` joins each row's run of adjacent dark modules into one rectangle, so the
-    X shrink only applies at the run's two ends, where black meets white.
+    X bleed only applies at the run's two ends, where black meets white.
     """
     module = side / len(matrix)
-    inset_x = module * shrink_pct[0] / 200
-    inset_y = module * shrink_pct[1] / 200
+    inset_x, inset_y = bleed_mm
     h = module - 2 * inset_y
     top = y + side
     for row, cells in enumerate(matrix):
@@ -145,31 +152,31 @@ def dark_rects(matrix, x, y, side, shrink_pct=(0.0, 0.0), merge_x=False):
             yield x + start * module + inset_x, ry, (col - start) * module - 2 * inset_x, h
 
 
-def draw_qr(draw, matrix, x, y, side, to_px, fill, shrink_pct=(0.0, 0.0), merge_x=False):
+def draw_qr(draw, matrix, x, y, side, to_px, fill, bleed_mm=(0.0, 0.0), merge_x=False):
     """
     Draw the dark modules of `matrix` into the square (x, y, side) given in bed mm.
 
     `to_px` maps a bed point (mm, y-up) to image pixels (y-down). Each edge is rounded
     on its own so the overall code size stays exact; modules differ by <= 1 px.
     """
-    for rx, ry, w, h in dark_rects(matrix, x, y, side, shrink_pct, merge_x):
+    for rx, ry, w, h in dark_rects(matrix, x, y, side, bleed_mm, merge_x):
         px0, py0 = to_px(rx, ry + h)
         px1, py1 = to_px(rx + w, ry)
         draw.rectangle((round(px0), round(py0), round(px1) - 1, round(py1) - 1), fill=fill)
 
 
-def render_canvas(matrix, x, y, side, canvas_w, canvas_h, dpi, shrink_pct=(0.0, 0.0), merge_x=False):
+def render_canvas(matrix, x, y, side, canvas_w, canvas_h, dpi, bleed_mm=(0.0, 0.0), merge_x=False):
     """The laser file: white bed, black modules. Mode "1" keeps a 300 DPI bed small."""
     img = Image.new("1", (round(mm_to_px(canvas_w, dpi)), round(mm_to_px(canvas_h, dpi))), 1)
 
     def to_px(bx, by):
         return mm_to_px(bx, dpi), mm_to_px(canvas_h - by, dpi)
 
-    draw_qr(ImageDraw.Draw(img), matrix, x, y, side, to_px, fill=0, shrink_pct=shrink_pct, merge_x=merge_x)
+    draw_qr(ImageDraw.Draw(img), matrix, x, y, side, to_px, fill=0, bleed_mm=bleed_mm, merge_x=merge_x)
     return img
 
 
-def write_pdf(matrix, x, y, side, canvas_w, canvas_h, path, shrink_pct=(0.0, 0.0), merge_x=False):
+def write_pdf(matrix, x, y, side, canvas_w, canvas_h, path, bleed_mm=(0.0, 0.0), merge_x=False):
     """
     The laser file as a vector PDF whose page is exactly the bed size.
 
@@ -177,9 +184,13 @@ def write_pdf(matrix, x, y, side, canvas_w, canvas_h, path, shrink_pct=(0.0, 0.0
     convention as the bed, so no flip is needed. Each dark module (or row run, with
     `merge_x`) is its own filled rectangle.
     """
+    write_rects_pdf(dark_rects(matrix, x, y, side, bleed_mm, merge_x), canvas_w, canvas_h, path)
+
+
+def write_rects_pdf(rects, canvas_w, canvas_h, path):
+    """Write (x0, y0, w, h) rectangles in bed mm (y-up) as black fills on a bed-sized PDF page."""
     pt = 72 / MM_PER_INCH
-    rects = [f"{rx * pt:.4f} {ry * pt:.4f} {w * pt:.4f} {h * pt:.4f} re"
-             for rx, ry, w, h in dark_rects(matrix, x, y, side, shrink_pct, merge_x)]
+    rects = [f"{rx * pt:.4f} {ry * pt:.4f} {w * pt:.4f} {h * pt:.4f} re" for rx, ry, w, h in rects]
     content = ("0 g\n" + "\n".join(rects) + "\nf\n").encode()
 
     objects = [
@@ -279,12 +290,15 @@ def main():
     parser.add_argument("--anchor", choices=ANCHORS, default=env("ANCHOR", "center"))
     parser.add_argument("--offset", default=env("OFFSET_MM", "0,0"), help='"dx,dy", up is +')
     parser.add_argument("--border", type=int, default=int(env("QR_BORDER", 4)), help="quiet zone, modules")
-    parser.add_argument("--bleed-shrink", default=env("BLEED_SHRINK_PERCENT", "0"),
-                        help='"x,y" %% of the module to shrink each dark module by, about its centre; '
+    parser.add_argument("--bleed-px", default=env("BLEED_PX", "0"),
+                        help='"x,y" px (at --dpi) to move each edge of each dark module inwards; '
                              'one number = both')
     parser.add_argument("--merge-x", action=argparse.BooleanOptionalAction,
                         default=env("MERGE_X_RUNS", "true").strip().lower() in ("1", "true", "yes", "on"),
-                        help="join each row's adjacent dark modules into one rectangle (X shrink at run ends only)")
+                        help="join each row's adjacent dark modules into one rectangle (X bleed at run ends only)")
+    parser.add_argument("--test-pattern", action="store_true",
+                        help="burn the bleed test pattern (test_pattern.py) instead of a QR code; ignores --url, "
+                             "--ec and --border")
     parser.add_argument("--ec", choices=ERROR_CORRECTION, default=env("QR_ERROR_CORRECTION", "M"))
     parser.add_argument("--out-dir", default=env("OUTPUT_DIR", "output"),
                         help="folder for the files below when given as relative paths")
@@ -293,17 +307,18 @@ def main():
     parser.add_argument("--preview", default=env("PREVIEW_PATH", ""), help="blank = no preview")
     args = parser.parse_args()
 
-    if not args.url:
+    if not args.url and not args.test_pattern:
         parser.error("No URL: set TARGET_URL in .env or pass --url")
     try:
-        bleed = parse_pair(args.bleed_shrink, "bleed shrink")
+        bleed_px = parse_pair(args.bleed_px, "bleed px")
         code_box = parse_code_size(args.code_size)
         offset = parse_offset(args.offset)
         part_offset = parse_offset(args.part_offset)
     except ValueError as e:
         parser.error(str(e))
-    if not all(0 <= v < 100 for v in bleed):
-        parser.error("--bleed-shrink values must be from 0 up to (not including) 100")
+    if not all(v >= 0 for v in bleed_px):
+        parser.error("--bleed-px values can't be negative")
+    bleed = tuple(px_to_mm(v, args.dpi) for v in bleed_px)
 
     # Relative output paths go inside the output folder (itself relative to this script).
     out_dir = project_dir / args.out_dir
@@ -312,7 +327,10 @@ def main():
     args.pdf = out_dir / args.pdf if args.pdf else None
     args.preview = out_dir / args.preview if args.preview else None
 
-    matrix = build_matrix(args.url, args.ec, args.border)
+    if args.test_pattern:
+        matrix, args.border = bleed_test_matrix(), 0
+    else:
+        matrix = build_matrix(args.url, args.ec, args.border)
     part_x, part_y = place_part(args.canvas_width, args.canvas_height, args.part_width, args.part_height,
                                 args.part_anchor, part_offset)
     if (part_x < 0 or part_y < 0
@@ -328,6 +346,10 @@ def main():
             or x + side > part_x + args.part_width + eps or y + side > part_y + args.part_height + eps):
         print("Warning: the code (with quiet zone) extends past the edge of the part.")
 
+    if any(2 * v >= side / len(matrix) for v in bleed):
+        raise SystemExit(f"Error: --bleed-px {bleed_px[0]:g},{bleed_px[1]:g} takes away the whole module "
+                         f"({mm_to_px(side / len(matrix), args.dpi):.1f} px).")
+
     img = render_canvas(matrix, x, y, side, args.canvas_width, args.canvas_height, args.dpi, bleed, args.merge_x)
     img.save(args.out, dpi=(args.dpi, args.dpi))
 
@@ -339,13 +361,14 @@ def main():
     print(f"Dark modules: bottom-left ({x + b:.2f}, {y + b:.2f}) mm, {side - 2 * b:.2f} mm, "
           f"module = {module_mm:.2f} mm ({mm_to_px(module_mm, args.dpi):.1f} px)")
     if any(bleed):
-        w_mm, h_mm = (module_mm * (1 - v / 100) for v in bleed)
+        w_mm, h_mm = (module_mm - 2 * v for v in bleed)
+        print(f"Bleed X {bleed_px[0]:g} px ({bleed[0]:.3f} mm), Y {bleed_px[1]:g} px ({bleed[1]:.3f} mm) "
+              f"off each edge of each dark area")
         if args.merge_x:
-            print(f"Bleed shrink X {bleed[0]:g}%, Y {bleed[1]:g}%, X runs merged: each run of dark modules is "
-                  f"{module_mm - w_mm:.3f} mm narrower than drawn and {h_mm:.3f} mm tall, "
-                  f"gaps {module_mm - h_mm:.3f} mm between rows")
+            print(f"  X runs merged: each run of dark modules is {module_mm - w_mm:.3f} mm narrower than drawn "
+                  f"and {h_mm:.3f} mm tall, gaps {module_mm - h_mm:.3f} mm between rows")
         else:
-            print(f"Bleed shrink X {bleed[0]:g}%, Y {bleed[1]:g}%: dark modules {w_mm:.3f} wide x {h_mm:.3f} mm tall, "
+            print(f"  Dark modules {w_mm:.3f} wide x {h_mm:.3f} mm tall, "
                   f"gaps {module_mm - w_mm:.3f} mm between left/right neighbours, "
                   f"{module_mm - h_mm:.3f} mm between top/bottom")
     if mm_to_px(module_mm, args.dpi) < 3:

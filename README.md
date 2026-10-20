@@ -4,6 +4,8 @@ Tools for making QR codes and engraving them on a laser cutter at true size.
 
 - **`qr-code.ipynb`**: a notebook for trying out QR codes, including a style with round dots.
 - **`place_qr.py`**: places a QR code on a workpiece and outputs a full-bed file (914.4 × 609.6 mm, 36 × 24 in) for the laser.
+- **`test_pattern.py`**: a small test pattern for finding the right bleed compensation (see [Test pattern](#test-pattern)).
+- **`make_bleed_sheet.py`**: puts the test pattern at four bleed settings in a row on one bed-sized file (see [Bleed test sheet](#bleed-test-sheet)).
 - **`make_examples.py`**: regenerates the diagrams in this README.
 
 ## Setup
@@ -41,14 +43,17 @@ python place_qr.py --part-width 300 --part-height 200 --part-anchor top-left --p
 # A part pushed into the bed's bottom-right corner instead
 python place_qr.py --part-anchor bottom-right
 
-# Compensate for laser bleed: shrink dark modules 12% in X (raster direction), 0% in Y
-python place_qr.py --bleed-shrink 12,0
+# Compensate for laser bleed: take 1 px off each edge in X (raster direction), none in Y
+python place_qr.py --bleed-px 1,0
 
-# Same 12% shrink in both X and Y
-python place_qr.py --bleed-shrink 12
+# Same 1 px in both X and Y
+python place_qr.py --bleed-px 1
 
 # Shrink every module separately, instead of merging each row's adjacent dark modules
-python place_qr.py --bleed-shrink 12,0 --no-merge-x
+python place_qr.py --bleed-px 1,0 --no-merge-x
+
+# Burn the bleed test pattern, 40 mm square, instead of a QR code
+python place_qr.py --test-pattern --code-size 40 --bleed-px 1,0
 
 # Encode a different URL, with no quiet zone and high error correction
 python place_qr.py --url https://example.com --border 0 --ec H
@@ -90,8 +95,9 @@ All the settings, with the `.env` key and the command-line flag for each.
 | `ANCHOR` | `--anchor` | `top-left`, `top-right`, `bottom-left`, `bottom-right` or `center`. |
 | `OFFSET_MM` | `--offset` | Shift `dx,dy` from the anchored position. Up is +. Blank or `0,0` means no shift. |
 | `QR_BORDER` | `--border` | Quiet-zone width in modules (default 4). It's counted **inside** the code size. |
-| `BLEED_SHRINK_PERCENT` | `--bleed-shrink` | `x,y`: shrinks each dark module about its centre by these % of the module size, separately across (X) and down (Y), to make up for the laser burning wider than drawn. One number applies to both. Default 0. Applies to both the PDF and the PNG. |
-| `MERGE_X_RUNS` | `--merge-x`, `--no-merge-x` | Joins each row's run of adjacent dark modules into one rectangle, so the X shrink only applies at the run's two ends, where black meets white. Default `true`. |
+| `BLEED_PX` | `--bleed-px` | `x,y`: pixels (at `DPI`) to take off each edge of each dark module, separately across (X) and down (Y), to make up for the laser burning wider than drawn. One number applies to both. Default 0. Applies to both the PDF and the PNG. |
+| `MERGE_X_RUNS` | `--merge-x`, `--no-merge-x` | Joins each row's run of adjacent dark modules into one rectangle, so the X bleed only applies at the run's two ends, where black meets white. Default `true`. |
+| (none) | `--test-pattern` | Burns the [test pattern](#test-pattern) instead of a QR code. `TARGET_URL`, `QR_ERROR_CORRECTION` and `QR_BORDER` are ignored. |
 | `QR_ERROR_CORRECTION` | `--ec` | `L`, `M`, `Q` or `H`. |
 | `DPI` | `--dpi` | Output resolution. Default 300. |
 | `TARGET_URL` | `--url` | The URL encoded in the code. |
@@ -165,39 +171,104 @@ To check the scale, do a test on scrap material and measure where the dark squar
 
 ## Bleed compensation
 
-If the white gaps come out narrower than the black squares, the laser is burning slightly past the edges of each module. Set `BLEED_SHRINK_PERCENT` to shrink every module about its centre, so the burn spreads back out to the full module size.
+If the white gaps come out narrower than the black squares, the laser is burning slightly past the edges of each module. Set `BLEED_PX` to move every edge of each dark module inwards, so the burn spreads back out to the full module size.
 
-The value is `x,y`: the % to shrink across (X) and down (Y). Each direction is set separately, because a raster laser usually bleeds mostly along X, its fast travel direction. `12,0` makes modules 12% narrower but keeps their full height. A single number such as `12` applies to both directions.
+The value is `x,y`: the number of pixels to take off **each edge**, across (X) and down (Y). Pixels are at `DPI`, so at 300 DPI 1 px is 0.0847 mm. Each direction is set separately, because a raster laser usually bleeds mostly along X, its fast travel direction. `1,0` takes 1 px off the left and right edges and keeps the full height. A single number such as `1` applies to both directions.
 
-**A positive value shrinks.** Each value is a % of the module size, taken off evenly on both sides. The setting can't enlarge modules; values must be from 0 up to (not including) 100.
+**Why px, not %:** the laser overburns each edge by a fixed distance, set by its spot size and the material, however big the modules are. A fixed amount stays right when you change the code size. A % would need retuning. Whole numbers of pixels also keep the PNG's edges exact (see [Whole-pixel module sizes](#whole-pixel-module-sizes)). Fractions such as `0.5` work: the PDF uses the exact distance and the PNG rounds it.
 
-**Merged X runs.** With `MERGE_X_RUNS=true` (the default), each row's run of adjacent dark modules is drawn as one rectangle. The X shrink is then taken only off the two ends of the run, where black meets white. Inside the run, where both neighbours are black, there's no bleed to correct, so no gaps are added. With `--no-merge-x`, every module is shrunk on its own, which leaves thin white gaps between black neighbours. Y shrink applies to every row either way.
+**A positive value shrinks.** The setting can't enlarge modules, and it must leave something of each module: under half a module per edge.
 
-![Top-left corner of a code: no shrink; 15% X shrink with separate modules; 15% X shrink with merged runs; 15% in both X and Y with merged runs. The module grid is in grey](docs/images/bleed-shrink.png)
+**Merged X runs.** With `MERGE_X_RUNS=true` (the default), each row's run of adjacent dark modules is drawn as one rectangle. The X bleed is then taken only off the two ends of the run, where black meets white. Inside the run, where both neighbours are black, there's no bleed to correct, so no gaps are added. With `--no-merge-x`, every module is shrunk on its own, which leaves thin white gaps between black neighbours. Y bleed applies to every row either way.
 
-**Finding the values.** Measure one direction at a time on a test burn with no compensation. For X, measure across a black square and across the white gap beside it. For Y, measure the same things top to bottom. Assuming the laser burns the same extra amount on both edges, the shrink for that direction is:
+![Top-left corner of a code drawn with 18 px modules: no bleed; 2 px X bleed with separate modules; 2 px X bleed with merged runs; 2 px in both X and Y with merged runs. The module grid is in grey](docs/images/bleed-shrink.png)
 
-  **(black − white) ÷ (black + white) × 100**
+**Finding the values.** Measure one direction at a time on a test burn with no compensation. For X, measure across a black square (or stripe) and across the white gap beside it. For Y, measure the same things top to bottom. The laser makes black wider by its overburn on both edges, and white narrower by the same, so the overburn per edge for that direction is:
 
-**Example.** Your code has 1.17 mm modules. Measured across (X), a black square is 1.30 mm and the white gap beside it is 1.04 mm. Measured top to bottom (Y), both are 1.17 mm.
+  **(black − white) ÷ 4**, in mm. Divide by the pixel size (0.0847 mm at 300 DPI) to get px.
 
-1. X: (1.30 − 1.04) ÷ (1.30 + 1.04) × 100 ≈ **11%**. Y: (1.17 − 1.17) ÷ 2.34 = **0%**.
+**Example.** Your code has 1.524 mm (18 px) modules. Measured across (X), a black stripe is 1.70 mm and the white gap beside it is 1.35 mm. Measured top to bottom (Y), both are 1.52 mm.
+
+1. X: (1.70 − 1.35) ÷ 4 = 0.0875 mm, ÷ 0.0847 ≈ **1 px**. Y: (1.52 − 1.52) ÷ 4 = **0 px**.
 2. Run it:
 
    ```bash
-   python place_qr.py --bleed-shrink 11,0
+   python place_qr.py --bleed-px 1,0
    ```
 
    The script prints:
 
    ```text
-   Bleed shrink X 11%, Y 0%, X runs merged: each run of dark modules is 0.129 mm narrower than drawn and 1.171 mm tall, gaps 0.000 mm between rows
+   Bleed X 1 px (0.085 mm), Y 0 px (0.000 mm) off each edge of each dark area
+     X runs merged: each run of dark modules is 0.169 mm narrower than drawn and 1.524 mm tall, gaps 0.000 mm between rows
    ```
 
-   The laser adds its extra 0.13 mm back to the width of each run, so black and white both come out at the full module width.
+   The laser adds its extra 0.085 mm back on each end of each run, so black and white both come out at the full module width.
 3. Burn another test. In each direction, if black still measures wider than white, increase that value. If white now measures wider, decrease it.
 
-The PNG can only change in whole pixels (0.085 mm at 300 DPI), so small percentages get rounded there. The PDF uses the exact value.
+### Test pattern
+
+A real QR code mixes every kind of edge together, which makes it hard to tell what's going wrong. `--test-pattern` burns a 38 × 38 module pattern instead, where each feature tests one thing:
+
+| | Left | Middle | Right |
+|---|---|---|---|
+| **Top** (1-module features) | 1×1 checkerboard | 1×1 dots, 1-module gaps | Vertical stripes, 1 wide |
+| **Middle** (2-module features) | 2×2 checkerboard | 2×2 dots, 2-module gaps | Vertical stripes, 2 wide |
+| **Bottom** | Horizontal stripes, 1 wide | Horizontal stripes, 2 wide | QR finder square, which also shows which way up the burn is |
+
+- **Stripes** are the ones to measure: vertical stripes give the black and white widths across (X), horizontal stripes top to bottom (Y). Use them in the formula above.
+- **Checkerboards** show where black squares meet only at their corners. Bleed there fills in the corners first.
+- **Dots** show how a lone dark module shrinks or swells, with no neighbours to merge with.
+- The **finder** is a familiar reference from a real code.
+
+The module size is `CODE_SIZE_MM` ÷ 38. To match your QR code, set `--code-size` to 38 × its module size (printed by a normal run): 1.17 mm modules need `--code-size 44.5`. Burn one pattern per bleed value, each with its own `--offset` and `--out`/`--pdf` names, and compare them side by side.
+
+![The test pattern at the same four settings as above. The module grid is in grey](docs/images/bleed-test-pattern.png)
+
+### Bleed test sheet
+
+`make_bleed_sheet.py` puts four test patterns in a row on one full-bed file, one for each setting in the diagram above, in the same left-to-right order:
+
+| # | Left edge | Setting |
+|---|---|---|
+| 1 | 0 mm | `--bleed-px 0,0 --no-merge-x` |
+| 2 | 73.152 mm | `--bleed-px 2,0 --no-merge-x` |
+| 3 | 146.304 mm | `--bleed-px 2,0 --merge-x` |
+| 4 | 219.456 mm | `--bleed-px 2,2 --merge-x` |
+
+```bash
+python make_bleed_sheet.py
+```
+
+This writes `output/bleed-sheet.pdf` (print this one) and `output/bleed-sheet.png`. The modules are 18 px (1.524 mm), the same as a 50 mm QR code (see [Whole-pixel module sizes](#whole-pixel-module-sizes)), so each pattern is 57.912 mm square. There are 10 white modules (15.24 mm) between patterns. The row runs from the bed's left edge to x = 277.368 mm, and from 275.844 to 333.756 mm up from the bottom, which centres it on 12 in, halfway up the 24 in bed.
+
+To compare powers and speeds, put a strip of material about 280 × 60 mm under the row and burn it. Then move the material so a fresh area is under the row, change the power or speed, and burn again. The PDF stays the same each time.
+
+Options: `--module` (mm), `--left` (mm), `--center-y` (mm up from the bottom), `--gap` (modules), and `--out-dir`, `--out` and `--pdf` for the output names. Run `python make_bleed_sheet.py --help` for the full list.
+
+### Whole-pixel module sizes
+
+At 300 DPI a pixel is 25.4 ÷ 300 = 0.084667 mm. If the module size isn't a whole number of pixels, the PNG rounds each module edge, so modules come out a pixel wider or narrower than each other. For example, a 48 mm code with 41 modules has 13.83 px modules, which become a mix of 13 and 14 px.
+
+To avoid this, use **18 px modules (exactly 1.524 mm, 0.06 in)**. These sizes give the QR code and the test pattern the same module size, so a test burn also shows how the final code's resolution will look:
+
+| What | Modules | `--code-size` | Size of dark area |
+|---|---|---|---|
+| QR code, 33 modules plus a 4-module quiet zone on each side | 41 | `62.484` | 50.292 mm |
+| Test pattern | 38 | `57.912` | 57.912 mm |
+
+```bash
+python place_qr.py --code-size 62.484
+python place_qr.py --test-pattern --code-size 57.912 --bleed-px 1,0 --out bleed-1.png --pdf bleed-1.pdf
+```
+
+The QR code's module count depends on the URL and `QR_ERROR_CORRECTION`. A normal run prints the module size. If it isn't 1.52 mm, set `--code-size` to 1.524 × (modules across + 2 × `QR_BORDER`).
+
+The PNG has no rounding only when all of these hold:
+
+- **Position:** the code's corner lands on a pixel edge. The `top-left` anchor with no offset does. Any offset must be a whole number of pixels, such as a multiple of 1.524 mm (one module) or 25.4 mm (300 px).
+- **Bleed:** `BLEED_PX` is a whole number.
+- **What the laser receives:** this is only about the PNG. The PDF holds exact sizes, and the laser driver converts it to pixels at the laser's own resolution, so if you print the PDF, the module size should be a whole number of pixels at that resolution instead.
 
 ## Regenerating these diagrams
 
